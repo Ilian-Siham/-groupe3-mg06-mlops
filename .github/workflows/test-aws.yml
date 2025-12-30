@@ -1,6 +1,7 @@
 name: Test AWS Connection
 on:
-  workflow_dispatch
+  workflow_dispatch:
+
 jobs:
   test-aws:
     runs-on: ubuntu-latest
@@ -10,12 +11,14 @@ jobs:
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: ${{ secrets.AWS_REGION }}- name: Test AWS credentials validity
-      
+          aws-region: ${{ secrets.AWS_REGION }}
+
       - name: Test AWS credentials validity
         run: |
           echo "Testing AWS credentials..."
-          aws sts get-caller-identity- name: List S3 buckets
+          aws sts get-caller-identity
+
+      - name: List S3 buckets
         run: |
           echo "Listing S3 buckets..."
           aws s3 ls
