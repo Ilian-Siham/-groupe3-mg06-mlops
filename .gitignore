@@ -1,0 +1,22 @@
+# Environnement virtuel
+tf_env/
+venv/
+env/
+.env
+
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Données (si elles sont volumineuses)
+data/raw/
+*.csv
+*.parquet
+*.json
+
+# Modèles sauvegardés
+models/*.joblib
+models/*.pkl
+
+# Docker
+.dockerignore
