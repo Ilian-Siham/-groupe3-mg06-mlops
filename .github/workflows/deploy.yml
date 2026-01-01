@@ -8,11 +8,10 @@ on:
 
 env:
   AWS_REGION: eu-west-3
-  ECR_REPOSITORY: ecr-g0mg00
-  ECS_CLUSTER: ecs-g0mg00
-  ECS_SERVICE: mlops-service-g0mg00
-  ECS_TASK_DEFINITION: mlops-task-g0mg00
-
+  ECR_REPOSITORY: ecr-g3mg06-terraform      # ← Change
+  ECS_CLUSTER: ecs-g3mg06-terraform         # ← Change
+  ECS_SERVICE: mlops-service-g3mg06         # ← Change
+  ECS_TASK_DEFINITION: mlops-task-g3mg06  
 jobs:
   terraform:
     name: Terraform Infrastructure
@@ -37,13 +36,13 @@ jobs:
       - name: Create S3 bucket for Terraform state
         run: |
           aws s3api create-bucket \
-            --bucket terraform-state-g0mg00 \
+            --bucket terraform-state-g3mg06 \
             --region eu-west-3 \
             --create-bucket-configuration LocationConstraint=eu-west-3 \
             2>/dev/null || echo "Bucket exists"
           
           aws s3api put-bucket-versioning \
-            --bucket terraform-state-g0mg00 \
+            --bucket terraform-state-g3mg06 \
             --versioning-configuration Status=Enabled
 
       - name: Terraform Init
@@ -94,11 +93,10 @@ jobs:
       - name: Get task execution role ARN
         id: get-role
         run: |
-          EXECUTION_ROLE_ARN=$(aws iam get-role --role-name ecs-g0mg00-task-execution-role --query 'Role.Arn' --output text)
-          TASK_ROLE_ARN=$(aws iam get-role --role-name ecs-g0mg00-task-role --query 'Role.Arn' --output text)
-          echo "execution_role_arn=$EXECUTION_ROLE_ARN" >> $GITHUB_OUTPUT
-          echo "task_role_arn=$TASK_ROLE_ARN" >> $GITHUB_OUTPUT
-
+         EXECUTION_ROLE_ARN=$(aws iam get-role --role-name ecs-g3mg06-terraform-task-execution-role --query 'Role.Arn' --output text)
+         TASK_ROLE_ARN=$(aws iam get-role --role-name ecs-g3mg06-terraform-task-role --query 'Role.Arn' --output text)
+         echo "execution_role_arn=$EXECUTION_ROLE_ARN" >> $GITHUB_OUTPUT
+         echo "task_role_arn=$TASK_ROLE_ARN" >> $GITHUB_OUTPUT
       - name: Create ECS Task Definition
         env:
           ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
@@ -182,13 +180,13 @@ jobs:
             
             # Créer un security group
             SG_ID=$(aws ec2 create-security-group \
-              --group-name mlops-sg-g0mg00 \
+              --group-name mlops-sg-g3mg06 \
               --description "Security group for MLOps ECS" \
               --vpc-id $VPC_ID \
               --query 'GroupId' \
               --output text 2>/dev/null || \
               aws ec2 describe-security-groups \
-                --filters "Name=group-name,Values=mlops-sg-g0mg00" \
+                --filters "Name=group-name,Values=mlops-sg-g3mg06" \
                 --query 'SecurityGroups[0].GroupId' \
                 --output text)
             
