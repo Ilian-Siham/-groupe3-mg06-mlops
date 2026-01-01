@@ -1,0 +1,249 @@
+name: Deploy MLOps Infrastructure
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+env:
+  AWS_REGION: eu-west-3
+  ECR_REPOSITORY: ecr-g0mg00
+  ECS_CLUSTER: ecs-g0mg00
+  ECS_SERVICE: mlops-service-g0mg00
+  ECS_TASK_DEFINITION: mlops-task-g0mg00
+
+jobs:
+  terraform:
+    name: Terraform Infrastructure
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v2
+        with:
+          terraform_version: 1.5.0
+
+      - name: Create S3 bucket for Terraform state
+        run: |
+          aws s3api create-bucket \
+            --bucket terraform-state-g0mg00 \
+            --region eu-west-3 \
+            --create-bucket-configuration LocationConstraint=eu-west-3 \
+            2>/dev/null || echo "Bucket exists"
+          
+          aws s3api put-bucket-versioning \
+            --bucket terraform-state-g0mg00 \
+            --versioning-configuration Status=Enabled
+
+      - name: Terraform Init
+        run: terraform init
+
+      - name: Terraform Plan
+        run: terraform plan
+
+      - name: Terraform Apply
+        run: terraform apply -auto-approve
+
+  build-and-deploy:
+    name: Build and Deploy Docker
+    needs: terraform
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v1
+
+      - name: Build Docker image
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
+          docker tag $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG $ECR_REGISTRY/$ECR_REPOSITORY:latest
+
+      - name: Push Docker image to ECR
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:latest
+
+      - name: Get task execution role ARN
+        id: get-role
+        run: |
+          EXECUTION_ROLE_ARN=$(aws iam get-role --role-name ecs-g0mg00-task-execution-role --query 'Role.Arn' --output text)
+          TASK_ROLE_ARN=$(aws iam get-role --role-name ecs-g0mg00-task-role --query 'Role.Arn' --output text)
+          echo "execution_role_arn=$EXECUTION_ROLE_ARN" >> $GITHUB_OUTPUT
+          echo "task_role_arn=$TASK_ROLE_ARN" >> $GITHUB_OUTPUT
+
+      - name: Create ECS Task Definition
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
+          EXECUTION_ROLE_ARN: ${{ steps.get-role.outputs.execution_role_arn }}
+          TASK_ROLE_ARN: ${{ steps.get-role.outputs.task_role_arn }}
+        run: |
+          cat > task-definition.json <<EOF
+          {
+            "family": "$ECS_TASK_DEFINITION",
+            "networkMode": "awsvpc",
+            "requiresCompatibilities": ["FARGATE"],
+            "cpu": "1024",
+            "memory": "2048",
+            "executionRoleArn": "$EXECUTION_ROLE_ARN",
+            "taskRoleArn": "$TASK_ROLE_ARN",
+            "containerDefinitions": [
+              {
+                "name": "mlops-container",
+                "image": "$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG",
+                "essential": true,
+                "portMappings": [
+                  {
+                    "containerPort": 8000,
+                    "protocol": "tcp"
+                  },
+                  {
+                    "containerPort": 8501,
+                    "protocol": "tcp"
+                  }
+                ],
+                "logConfiguration": {
+                  "logDriver": "awslogs",
+                  "options": {
+                    "awslogs-group": "/ecs/$ECS_TASK_DEFINITION",
+                    "awslogs-region": "$AWS_REGION",
+                    "awslogs-stream-prefix": "ecs",
+                    "awslogs-create-group": "true"
+                  }
+                }
+              }
+            ]
+          }
+          EOF
+
+      - name: Register Task Definition
+        run: |
+          aws ecs register-task-definition \
+            --cli-input-json file://task-definition.json
+
+      - name: Create or Update ECS Service
+        run: |
+          # Vérifier si le service existe
+          SERVICE_EXISTS=$(aws ecs describe-services \
+            --cluster $ECS_CLUSTER \
+            --services $ECS_SERVICE \
+            --query 'services[0].status' \
+            --output text 2>/dev/null || echo "NONE")
+          
+          if [ "$SERVICE_EXISTS" = "ACTIVE" ]; then
+            echo "Service exists, updating..."
+            aws ecs update-service \
+              --cluster $ECS_CLUSTER \
+              --service $ECS_SERVICE \
+              --task-definition $ECS_TASK_DEFINITION \
+              --force-new-deployment
+          else
+            echo "Creating new service..."
+            
+            # Obtenir le VPC par défaut
+            VPC_ID=$(aws ec2 describe-vpcs \
+              --filters "Name=isDefault,Values=true" \
+              --query 'Vpcs[0].VpcId' \
+              --output text)
+            
+            # Obtenir les subnets
+            SUBNETS=$(aws ec2 describe-subnets \
+              --filters "Name=vpc-id,Values=$VPC_ID" \
+              --query 'Subnets[*].SubnetId' \
+              --output text | tr '\t' ',')
+            
+            # Créer un security group
+            SG_ID=$(aws ec2 create-security-group \
+              --group-name mlops-sg-g0mg00 \
+              --description "Security group for MLOps ECS" \
+              --vpc-id $VPC_ID \
+              --query 'GroupId' \
+              --output text 2>/dev/null || \
+              aws ec2 describe-security-groups \
+                --filters "Name=group-name,Values=mlops-sg-g0mg00" \
+                --query 'SecurityGroups[0].GroupId' \
+                --output text)
+            
+            # Autoriser le trafic
+            aws ec2 authorize-security-group-ingress \
+              --group-id $SG_ID \
+              --protocol tcp \
+              --port 8000 \
+              --cidr 0.0.0.0/0 2>/dev/null || true
+            
+            aws ec2 authorize-security-group-ingress \
+              --group-id $SG_ID \
+              --protocol tcp \
+              --port 8501 \
+              --cidr 0.0.0.0/0 2>/dev/null || true
+            
+            # Créer le service
+            aws ecs create-service \
+              --cluster $ECS_CLUSTER \
+              --service-name $ECS_SERVICE \
+              --task-definition $ECS_TASK_DEFINITION \
+              --desired-count 1 \
+              --launch-type FARGATE \
+              --network-configuration "awsvpcConfiguration={subnets=[$SUBNETS],securityGroups=[$SG_ID],assignPublicIp=ENABLED}"
+          fi
+
+      - name: Wait for deployment
+        run: |
+          echo "Waiting for service to stabilize..."
+          aws ecs wait services-stable \
+            --cluster $ECS_CLUSTER \
+            --services $ECS_SERVICE
+
+      - name: Get service URL
+        run: |
+          TASK_ARN=$(aws ecs list-tasks \
+            --cluster $ECS_CLUSTER \
+            --service-name $ECS_SERVICE \
+            --query 'taskArns[0]' \
+            --output text)
+          
+          if [ "$TASK_ARN" != "None" ]; then
+            ENI_ID=$(aws ecs describe-tasks \
+              --cluster $ECS_CLUSTER \
+              --tasks $TASK_ARN \
+              --query 'tasks[0].attachments[0].details[?name==`networkInterfaceId`].value' \
+              --output text)
+            
+            PUBLIC_IP=$(aws ec2 describe-network-interfaces \
+              --network-interface-ids $ENI_ID \
+              --query 'NetworkInterfaces[0].Association.PublicIp' \
+              --output text)
+            
+            echo "==================================="
+            echo "API disponible sur: http://$PUBLIC_IP:8000"
+            echo "Streamlit disponible sur: http://$PUBLIC_IP:8501"
+            echo "==================================="
+          fi
